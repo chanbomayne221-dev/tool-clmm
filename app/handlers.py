@@ -66,10 +66,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    res = await build_next_prediction_message()
+    # Always refresh from the source Telegram room before predicting,
+    # so we react to the latest #session immediately.
+    res = await build_next_prediction_message(refresh_from_source=True)
     if not res:
         await update.message.reply_text(
-            "⏳ Chưa có dữ liệu phiên nào. Vui lòng đợi bot thu thập kết quả từ nhóm nguồn."
+            "⏳ Không lấy được dữ liệu từ room nguồn. "
+            "Kiểm tra SESSION_STRING / SOURCE_CHAT_USERNAME rồi thử lại."
         )
         return
     _, msg, _, _ = res

@@ -15,6 +15,9 @@ ADMIN_IDS = [
 _src = os.getenv("SOURCE_CHAT_ID", "").strip()
 SOURCE_CHAT_ID = int(_src) if _src.lstrip("-").isdigit() else None
 
+# Username of source room (without @). Used for on-demand realtime fetch.
+SOURCE_CHAT_USERNAME = os.getenv("SOURCE_CHAT_USERNAME", "lichsuphienclmmgg").lstrip("@").strip()
+
 DB_PATH = os.getenv("DB_PATH", "data/bot.db")
 
 # Prediction tuning

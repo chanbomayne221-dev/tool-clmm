@@ -1,15 +1,20 @@
-"""Telethon userbot listener: reads source chat in realtime."""
+"""Telethon userbot listener: reads source chat in realtime.
+Uses the shared client from telethon_client so on-demand fetches and
+the realtime listener share a single Telegram session.
+"""
 import asyncio
 import logging
-from typing import Optional
 
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
+from telethon import events
 
-from .config import API_ID, API_HASH, SESSION_STRING, SOURCE_CHAT_ID, SEND_COOLDOWN_SECONDS
+from .config import SOURCE_CHAT_ID, SOURCE_CHAT_USERNAME, SEND_COOLDOWN_SECONDS
 from .database import db
 from .parser import parse_result
-from .prediction_service import build_next_prediction_message, record_prediction_outcome_if_any
+from .prediction_service import (
+    build_next_prediction_message,
+    record_prediction_outcome_if_any,
+)
+from .telethon_client import get_client
 
 log = logging.getLogger(__name__)
 
@@ -17,24 +22,16 @@ _last_send_ts = 0.0
 
 
 async def _maybe_broadcast_prediction(bot_app):
-    """Build prediction for next session and send to all auto groups."""
     global _last_send_ts
     res = await build_next_prediction_message()
     if not res:
         return
     next_session, msg, label, conf = res
 
-    # dedupe: only insert if new
-    inserted = await db.insert_prediction(next_session, label, conf)
-    if not inserted:
-        log.info("Prediction for #%s already sent, skip.", next_session)
-        return
-
     groups = await db.auto_groups()
     if not groups:
         return
 
-    # anti-spam delay
     now = asyncio.get_event_loop().time()
     delta = now - _last_send_ts
     if delta < SEND_COOLDOWN_SECONDS:
@@ -62,61 +59,68 @@ async def _handle_text(text: str, bot_app):
         timestamp=parsed["timestamp"],
     )
     if not inserted:
-        return  # duplicate, ignore
+        return
     log.info(
         "New session #%s dice=%s total=%s %s %s",
         parsed["session_number"], parsed["dice_values"], parsed["total"],
         parsed["tai_xiu"], parsed["chan_le"],
     )
-    # Grade previous prediction if it targeted this session
     await record_prediction_outcome_if_any(parsed)
-    # Build & broadcast next prediction
     await _maybe_broadcast_prediction(bot_app)
 
 
 async def run_listener(bot_app, stop_event: asyncio.Event):
-    """Run the Telethon client with auto-reconnect loop."""
-    if not API_ID or not API_HASH or not SESSION_STRING:
-        log.error("Missing API_ID/API_HASH/SESSION_STRING. Telethon listener disabled.")
-        return
-
+    """Run the Telethon listener (auto-reconnect loop) on the shared client."""
     while not stop_event.is_set():
-        client: Optional[TelegramClient] = None
+        client = await get_client()
+        if client is None:
+            log.error("Telethon not configured / not authorized. Retrying in 30s.")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                pass
+            continue
+
         try:
-            client = TelegramClient(
-                StringSession(SESSION_STRING), API_ID, API_HASH,
-                auto_reconnect=True, connection_retries=999, retry_delay=5,
-            )
+            target_chat_id = SOURCE_CHAT_ID
+            target_entity = None
+            if target_chat_id is None and SOURCE_CHAT_USERNAME:
+                try:
+                    target_entity = await client.get_entity(SOURCE_CHAT_USERNAME)
+                    target_chat_id = target_entity.id
+                except Exception as e:
+                    log.exception("Cannot resolve @%s: %s", SOURCE_CHAT_USERNAME, e)
 
             @client.on(events.NewMessage())
             async def _on_new(event):
                 try:
-                    if SOURCE_CHAT_ID is not None and event.chat_id != SOURCE_CHAT_ID:
-                        return
-                    text = event.raw_text or ""
-                    await _handle_text(text, bot_app)
+                    if target_chat_id is not None and event.chat_id != target_chat_id:
+                        # Telegram chat ids for channels often start with -100; be lenient
+                        if abs(event.chat_id) != abs(target_chat_id):
+                            return
+                    await _handle_text(event.raw_text or "", bot_app)
                 except Exception as e:
                     log.exception("Handler error: %s", e)
 
             @client.on(events.MessageEdited())
             async def _on_edit(event):
                 try:
-                    if SOURCE_CHAT_ID is not None and event.chat_id != SOURCE_CHAT_ID:
-                        return
-                    text = event.raw_text or ""
-                    await _handle_text(text, bot_app)
+                    if target_chat_id is not None and event.chat_id != target_chat_id:
+                        if abs(event.chat_id) != abs(target_chat_id):
+                            return
+                    await _handle_text(event.raw_text or "", bot_app)
                 except Exception as e:
                     log.exception("Edit handler error: %s", e)
 
-            await client.start()
             me = await client.get_me()
-            log.info("Telethon connected as %s (id=%s)", getattr(me, "username", None), me.id)
-            log.info("Listening on SOURCE_CHAT_ID=%s", SOURCE_CHAT_ID)
+            log.info("Telethon listener active as %s (id=%s); source=%s",
+                     getattr(me, "username", None), me.id,
+                     target_chat_id or SOURCE_CHAT_USERNAME)
 
-            # Wait until stop_event OR disconnect
             disconnected = client.disconnected
             done, pending = await asyncio.wait(
-                {asyncio.create_task(stop_event.wait()), asyncio.create_task(disconnected)},
+                {asyncio.create_task(stop_event.wait()),
+                 asyncio.create_task(disconnected)},
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for t in pending:
@@ -128,10 +132,4 @@ async def run_listener(bot_app, stop_event: asyncio.Event):
             log.warning("Telethon disconnected, reconnecting in 5s...")
         except Exception as e:
             log.exception("Listener crashed: %s; restart in 5s", e)
-        finally:
-            if client is not None:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
         await asyncio.sleep(5)
