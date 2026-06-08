@@ -1,0 +1,28 @@
+services:
+  - type: worker
+    name: telegram-prediction-bot
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    disk:
+      name: bot-data
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: SESSION_STRING
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: SOURCE_CHAT_ID
+        sync: false
+      - key: DB_PATH
+        value: /app/data/bot.db
+      - key: TZ
+        value: Asia/Ho_Chi_Minh
