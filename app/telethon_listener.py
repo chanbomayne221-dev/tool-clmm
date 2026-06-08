@@ -1,20 +1,21 @@
 """Telethon userbot listener: reads source chat in realtime.
-Uses the shared client from telethon_client so on-demand fetches and
-the realtime listener share a single Telegram session.
+
+Source chat is dynamic (from DB). When admin changes it via the
+"📡 Nhóm check LS" menu, the listener resubscribes automatically.
 """
 import asyncio
 import logging
 
 from telethon import events
 
-from .config import SOURCE_CHAT_ID, SOURCE_CHAT_USERNAME, SEND_COOLDOWN_SECONDS
+from .config import SEND_COOLDOWN_SECONDS
 from .database import db
 from .parser import parse_result
 from .prediction_service import (
     build_next_prediction_message,
     record_prediction_outcome_if_any,
 )
-from .telethon_client import get_client
+from .telethon_client import get_client, get_source
 
 log = logging.getLogger(__name__)
 
@@ -23,14 +24,17 @@ _last_send_ts = 0.0
 
 async def _maybe_broadcast_prediction(bot_app):
     global _last_send_ts
-    res = await build_next_prediction_message()
-    if not res:
+    # Only broadcast when admin has enabled auto for at least one group.
+    if (await db.get_setting("auto_enabled")) != "1":
         return
-    next_session, msg, label, conf = res
-
     groups = await db.auto_groups()
     if not groups:
         return
+
+    res = await build_next_prediction_message()
+    if not res:
+        return
+    _next_session, msg, _label, _conf = res
 
     now = asyncio.get_event_loop().time()
     delta = now - _last_send_ts
@@ -70,7 +74,9 @@ async def _handle_text(text: str, bot_app):
 
 
 async def run_listener(bot_app, stop_event: asyncio.Event):
-    """Run the Telethon listener (auto-reconnect loop) on the shared client."""
+    """Listener loop. Re-resolves the source room each iteration so admin
+    changes via 📡 Nhóm check LS take effect without restarting the bot.
+    """
     while not stop_event.is_set():
         client = await get_client()
         if client is None:
@@ -81,55 +87,80 @@ async def run_listener(bot_app, stop_event: asyncio.Event):
                 pass
             continue
 
+        source = await get_source()
+        target_chat_id = None
+        if source is not None:
+            try:
+                entity = await client.get_entity(source)
+                target_chat_id = entity.id
+            except Exception as e:
+                log.exception("Cannot resolve source %s: %s", source, e)
+
+        if target_chat_id is None:
+            log.warning("No source room configured. Waiting 15s.")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                pass
+            continue
+
+        # Snapshot the current source so we can detect admin changes.
+        current_source_snapshot = str(source)
+
+        @client.on(events.NewMessage())
+        async def _on_new(event):
+            try:
+                if abs(event.chat_id) != abs(target_chat_id):
+                    return
+                await _handle_text(event.raw_text or "", bot_app)
+            except Exception as e:
+                log.exception("Handler error: %s", e)
+
+        @client.on(events.MessageEdited())
+        async def _on_edit(event):
+            try:
+                if abs(event.chat_id) != abs(target_chat_id):
+                    return
+                await _handle_text(event.raw_text or "", bot_app)
+            except Exception as e:
+                log.exception("Edit handler error: %s", e)
+
         try:
-            target_chat_id = SOURCE_CHAT_ID
-            target_entity = None
-            if target_chat_id is None and SOURCE_CHAT_USERNAME:
-                try:
-                    target_entity = await client.get_entity(SOURCE_CHAT_USERNAME)
-                    target_chat_id = target_entity.id
-                except Exception as e:
-                    log.exception("Cannot resolve @%s: %s", SOURCE_CHAT_USERNAME, e)
-
-            @client.on(events.NewMessage())
-            async def _on_new(event):
-                try:
-                    if target_chat_id is not None and event.chat_id != target_chat_id:
-                        # Telegram chat ids for channels often start with -100; be lenient
-                        if abs(event.chat_id) != abs(target_chat_id):
-                            return
-                    await _handle_text(event.raw_text or "", bot_app)
-                except Exception as e:
-                    log.exception("Handler error: %s", e)
-
-            @client.on(events.MessageEdited())
-            async def _on_edit(event):
-                try:
-                    if target_chat_id is not None and event.chat_id != target_chat_id:
-                        if abs(event.chat_id) != abs(target_chat_id):
-                            return
-                    await _handle_text(event.raw_text or "", bot_app)
-                except Exception as e:
-                    log.exception("Edit handler error: %s", e)
-
             me = await client.get_me()
             log.info("Telethon listener active as %s (id=%s); source=%s",
-                     getattr(me, "username", None), me.id,
-                     target_chat_id or SOURCE_CHAT_USERNAME)
+                     getattr(me, "username", None), me.id, source)
+
+            async def _watch_source_change():
+                while not stop_event.is_set():
+                    await asyncio.sleep(5)
+                    new_src = await get_source()
+                    if str(new_src) != current_source_snapshot:
+                        log.info("Source changed: %s -> %s; rebinding listener.",
+                                 current_source_snapshot, new_src)
+                        return
 
             disconnected = client.disconnected
             done, pending = await asyncio.wait(
-                {asyncio.create_task(stop_event.wait()),
-                 asyncio.create_task(disconnected)},
+                {
+                    asyncio.create_task(stop_event.wait()),
+                    asyncio.create_task(disconnected),
+                    asyncio.create_task(_watch_source_change()),
+                },
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for t in pending:
                 t.cancel()
-
-            if stop_event.is_set():
-                log.info("Stop requested; shutting down listener.")
-                break
-            log.warning("Telethon disconnected, reconnecting in 5s...")
         except Exception as e:
             log.exception("Listener crashed: %s; restart in 5s", e)
-        await asyncio.sleep(5)
+        finally:
+            # Remove our handlers before next loop iteration so we don't stack.
+            try:
+                client.remove_event_handler(_on_new)
+                client.remove_event_handler(_on_edit)
+            except Exception:
+                pass
+
+        if stop_event.is_set():
+            log.info("Stop requested; shutting down listener.")
+            break
+        await asyncio.sleep(2)

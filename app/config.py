@@ -12,11 +12,13 @@ ADMIN_IDS = [
     int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()
 ]
 
+# Optional initial defaults. The runtime source room is stored in DB
+# (settings.source_chat) and can be changed any time by an admin via
+# the "📡 Nhóm check LS" menu. These env values are ONLY used as a
+# first-boot default when DB has no value yet.
 _src = os.getenv("SOURCE_CHAT_ID", "").strip()
-SOURCE_CHAT_ID = int(_src) if _src.lstrip("-").isdigit() else None
-
-# Username of source room (without @). Used for on-demand realtime fetch.
-SOURCE_CHAT_USERNAME = os.getenv("SOURCE_CHAT_USERNAME", "lichsuphienclmmgg").lstrip("@").strip()
+DEFAULT_SOURCE_CHAT_ID = int(_src) if _src.lstrip("-").isdigit() else None
+DEFAULT_SOURCE_CHAT_USERNAME = os.getenv("SOURCE_CHAT_USERNAME", "").lstrip("@").strip()
 
 DB_PATH = os.getenv("DB_PATH", "data/bot.db")
 

@@ -18,19 +18,13 @@ log = logging.getLogger(__name__)
 async def build_next_prediction_message(
     refresh_from_source: bool = False,
 ) -> Optional[Tuple[int, str, str, float]]:
-    """Return (next_session, message, label, confidence) or None.
-
-    If refresh_from_source=True, fetches latest results from the source
-    Telegram room first (used when the user presses the button).
-    """
-    # 1. Try to refresh history from source room in realtime.
+    """Return (next_session, message, label, confidence) or None."""
     if refresh_from_source:
         await fetch_latest_sessions(limit=30)
 
     last = await db.last_session()
-
-    # 2. If DB still empty, do a bigger backfill scan and try again.
     if not last:
+        # bigger backfill scan 20–50 phiên
         await fetch_latest_sessions(limit=50)
         last = await db.last_session()
         if not last:
@@ -38,16 +32,15 @@ async def build_next_prediction_message(
 
     target = int(last["session_number"]) + 1
 
-    # 3. CACHED: if we already predicted for this target session, reuse it.
+    # CACHED: same target session => same answer, always.
     existing = await db.get_prediction(target)
     if existing:
         label = existing["prediction"]
         conf = float(existing["confidence"])
     else:
         history = await db.recent_sessions(limit=300)
-        seq = [h["tai_xiu"] for h in history]  # newest first
+        seq = [h["tai_xiu"] for h in history]
         label, conf = predict_next(seq)
-        # Save immediately so subsequent calls return the same answer.
         await db.insert_prediction(target, label, conf)
 
     history = await db.recent_sessions(limit=10)
@@ -70,7 +63,6 @@ async def build_next_prediction_message(
 
 
 async def record_prediction_outcome_if_any(new_session: dict):
-    """When a new session arrives, grade the prediction we made for it."""
     pred = await db.get_prediction(new_session["session_number"])
     if not pred or pred.get("prediction_correct") is not None:
         return

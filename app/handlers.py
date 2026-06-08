@@ -9,15 +9,16 @@ from telegram.ext import (
 from .config import ADMIN_IDS, BOT_TOKEN
 from .database import db
 from .menu import (
-    main_menu, admin_menu,
+    main_menu, admin_menu, auto_control_menu,
     BTN_PREDICT, BTN_STATS, BTN_HELP, BTN_ADMIN,
-    BTN_ADMIN_AUTO, BTN_ADMIN_BAN, BTN_ADMIN_USERS,
+    BTN_ADMIN_AUTO, BTN_ADMIN_SOURCE, BTN_ADMIN_BAN, BTN_ADMIN_USERS,
     BTN_ADMIN_BROADCAST, BTN_ADMIN_SETTINGS, BTN_BACK,
+    BTN_AUTO_RUN, BTN_AUTO_STOP, BTN_AUTO_CHANGE,
 )
 from .prediction_service import build_next_prediction_message
+from .telethon_client import verify_source, set_source, get_source, _normalize_input
 
 log = logging.getLogger(__name__)
-
 
 # Conversation state per user
 PENDING = {}  # user_id -> state string
@@ -66,13 +67,11 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Always refresh from the source Telegram room before predicting,
-    # so we react to the latest #session immediately.
     res = await build_next_prediction_message(refresh_from_source=True)
     if not res:
         await update.message.reply_text(
-            "⏳ Không lấy được dữ liệu từ room nguồn. "
-            "Kiểm tra SESSION_STRING / SOURCE_CHAT_USERNAME rồi thử lại."
+            "⏳ Không lấy được dữ liệu từ room nguồn.\n\n"
+            "Admin hãy vào 👑 Admin → 📡 Nhóm check LS để đặt room nguồn."
         )
         return
     _, msg, _, _ = res
@@ -102,8 +101,9 @@ async def on_admin_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(uid):
         await update.message.reply_text("❌ Bạn không có quyền.")
         return
-    await update.message.reply_text("👑 *Admin menu*", parse_mode="Markdown",
-                                    reply_markup=admin_menu())
+    await update.message.reply_text(
+        "👑 *Admin menu*", parse_mode="Markdown", reply_markup=admin_menu()
+    )
 
 
 async def on_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -112,16 +112,79 @@ async def on_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⬅️ Quay lại menu chính", reply_markup=main_menu(uid))
 
 
+# ---------- 📡 Nhóm check LS ----------
+
+async def on_admin_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+    current = await get_source()
+    PENDING[uid] = "await_source"
+    await update.message.reply_text(
+        "📌 Gửi *link / username / ID* nhóm dùng để check lịch sử phiên.\n\n"
+        f"🔎 Hiện tại: `{current or 'chưa cấu hình'}`",
+        parse_mode="Markdown",
+    )
+
+
+# ---------- 🚀 Auto group ----------
+
+async def _show_auto_status(update: Update):
+    groups = await db.auto_groups()
+    enabled = (await db.get_setting("auto_enabled")) == "1"
+    if not groups:
+        PENDING[update.effective_user.id] = "await_auto_group"
+        await update.message.reply_text(
+            "📌 Gửi *link / username / ID* nhóm cần chạy tự động.",
+            parse_mode="Markdown",
+        )
+        return
+    status = "✅ Đang chạy" if enabled else "⏸ Đang tắt"
+    lines = [
+        "📡 *Trạng thái tự động nhóm*",
+        "",
+        status,
+        "",
+        "🆔 Nhóm:",
+    ]
+    for g in groups:
+        lines.append(f"`{g}`")
+    lines += ["", "⚙️ Chọn thao tác:"]
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="Markdown", reply_markup=auto_control_menu()
+    )
+
+
 async def on_admin_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
         return
-    PENDING[uid] = "await_auto_group_id"
-    await update.message.reply_text(
-        "Nhập chat ID nhóm (ví dụ: -100xxxxxxxxxx)\n"
-        "Gõ 'off <chat_id>' để tắt tự động cho nhóm đó."
-    )
+    await _show_auto_status(update)
 
+
+async def on_auto_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await db.set_setting("auto_enabled", "1")
+    await update.message.reply_text("▶️ Đã bật auto. Bot sẽ gửi dự đoán mỗi phiên mới.")
+
+
+async def on_auto_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await db.set_setting("auto_enabled", "0")
+    await update.message.reply_text("⛔ Đã tắt auto (không xoá nhóm).")
+
+
+async def on_auto_change(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+    PENDING[uid] = "await_auto_group_change"
+    await update.message.reply_text("📌 Gửi *link / username / ID* nhóm mới.", parse_mode="Markdown")
+
+
+# ---------- Other admin ----------
 
 async def on_admin_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -160,12 +223,84 @@ async def on_admin_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     groups = await db.auto_groups()
+    source = await get_source()
+    enabled = (await db.get_setting("auto_enabled")) == "1"
     text = "⚙️ *Cài đặt bot*\n\n"
+    text += f"📡 Nhóm nguồn: `{source or 'chưa cấu hình'}`\n"
+    text += f"🚀 Auto: {'✅ bật' if enabled else '⏸ tắt'}\n"
     text += f"🏠 Auto groups: {len(groups)}\n"
     for g in groups:
         text += f"• `{g}`\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
+
+# ---------- helpers for verify+save ----------
+
+async def _handle_source_input(update: Update, text: str):
+    await update.message.reply_text("⏳ Đang kiểm tra room…")
+    ok, info, normalized = await verify_source(text)
+    if not ok:
+        await update.message.reply_text(
+            "❌ Không đọc được room nguồn.\n\n"
+            "Kiểm tra:\n• link nhóm\n• session Telegram\n• quyền đọc room\n\n"
+            f"Chi tiết: {info}"
+        )
+        return
+    await set_source(normalized)
+    from datetime import datetime
+    await db.set_setting("source_updated_by", str(update.effective_user.id))
+    await db.set_setting("source_updated_at", datetime.utcnow().isoformat())
+    await update.message.reply_text(
+        f"✅ Đã cập nhật nhóm check lịch sử phiên\n\nNguồn: `{normalized}`",
+        parse_mode="Markdown",
+        reply_markup=admin_menu(),
+    )
+
+
+async def _handle_auto_group_input(update: Update, text: str, replace: bool):
+    norm = _normalize_input(text)
+    if norm is None:
+        await update.message.reply_text("❌ Không nhận diện được link / username / ID.")
+        return
+    # We accept it as the broadcast target. For group ids we expect numeric -100…
+    if replace:
+        # remove previously configured groups
+        for g in await db.auto_groups():
+            await db.remove_auto_group(g)
+    # Verify via telethon if non-numeric, to resolve to numeric id
+    target_id = None
+    if isinstance(norm, int):
+        target_id = norm
+    else:
+        ok, info, normalized = await verify_source(text)
+        if not ok:
+            await update.message.reply_text(
+                f"❌ Không xác minh được nhóm.\n\nChi tiết: {info}"
+            )
+            return
+        # try to get numeric id from telethon
+        from .telethon_client import get_client
+        client = await get_client()
+        try:
+            entity = await client.get_entity(normalized)
+            target_id = entity.id
+            # ensure -100 prefix for supergroups/channels for Bot API
+            if hasattr(entity, "megagroup") or hasattr(entity, "broadcast"):
+                target_id = int(f"-100{entity.id}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Không lấy được chat id: {e}")
+            return
+
+    await db.add_auto_group(target_id)
+    await db.set_setting("auto_enabled", "1")
+    await update.message.reply_text(
+        f"✅ Đã lưu nhóm auto: `{target_id}` và bật chạy.",
+        parse_mode="Markdown",
+        reply_markup=admin_menu(),
+    )
+
+
+# ---------- main text router ----------
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _track_and_check(update):
@@ -184,37 +319,42 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await on_admin_entry(update, ctx)
     if text == BTN_BACK:
         return await on_back(update, ctx)
-    if text == BTN_ADMIN_AUTO:
-        return await on_admin_auto(update, ctx)
-    if text == BTN_ADMIN_BAN:
-        return await on_admin_ban(update, ctx)
-    if text == BTN_ADMIN_USERS:
-        return await on_admin_users(update, ctx)
-    if text == BTN_ADMIN_BROADCAST:
-        return await on_admin_broadcast(update, ctx)
-    if text == BTN_ADMIN_SETTINGS:
-        return await on_admin_settings(update, ctx)
+
+    # Admin-only buttons — silently ignored for non-admins
+    if is_admin(uid):
+        if text == BTN_ADMIN_AUTO:
+            return await on_admin_auto(update, ctx)
+        if text == BTN_ADMIN_SOURCE:
+            return await on_admin_source(update, ctx)
+        if text == BTN_ADMIN_BAN:
+            return await on_admin_ban(update, ctx)
+        if text == BTN_ADMIN_USERS:
+            return await on_admin_users(update, ctx)
+        if text == BTN_ADMIN_BROADCAST:
+            return await on_admin_broadcast(update, ctx)
+        if text == BTN_ADMIN_SETTINGS:
+            return await on_admin_settings(update, ctx)
+        if text == BTN_AUTO_RUN:
+            return await on_auto_run(update, ctx)
+        if text == BTN_AUTO_STOP:
+            return await on_auto_stop(update, ctx)
+        if text == BTN_AUTO_CHANGE:
+            return await on_auto_change(update, ctx)
 
     # Pending admin inputs
     state = PENDING.get(uid)
     if state and is_admin(uid):
-        if state == "await_auto_group_id":
+        if state == "await_source":
             PENDING.pop(uid, None)
-            parts = text.split()
-            if parts[0].lower() == "off" and len(parts) == 2 and parts[1].lstrip("-").isdigit():
-                cid = int(parts[1])
-                await db.remove_auto_group(cid)
-                await update.message.reply_text(f"✅ Đã tắt auto cho `{cid}`", parse_mode="Markdown")
-                return
-            if not text.lstrip("-").isdigit():
-                await update.message.reply_text("❌ Chat ID không hợp lệ.")
-                return
-            cid = int(text)
-            await db.add_auto_group(cid)
-            await update.message.reply_text(
-                f"✅ Đã bật tự động gửi dự đoán vào nhóm `{cid}`", parse_mode="Markdown"
-            )
-            return
+            return await _handle_source_input(update, text)
+
+        if state == "await_auto_group":
+            PENDING.pop(uid, None)
+            return await _handle_auto_group_input(update, text, replace=False)
+
+        if state == "await_auto_group_change":
+            PENDING.pop(uid, None)
+            return await _handle_auto_group_input(update, text, replace=True)
 
         if state == "await_ban":
             PENDING.pop(uid, None)
